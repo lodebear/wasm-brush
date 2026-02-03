@@ -39,9 +39,9 @@ pub enum OpenFile {
     /// A file open for reading or writing.
     File(std::fs::File),
     /// A read end of a pipe.
-    PipeReader(std::io::PipeReader),
+    PipeReader(sys::pipes::PipeReader),
     /// A write end of a pipe.
-    PipeWriter(std::io::PipeWriter),
+    PipeWriter(sys::pipes::PipeWriter),
     /// A custom stream.
     Stream(Box<dyn Stream>),
 }
@@ -184,6 +184,15 @@ impl OpenFile {
             Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => false,
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn pipe_handle(&self) -> Option<u32> {
+        match self {
+            Self::PipeReader(reader) => Some(reader.handle()),
+            Self::PipeWriter(writer) => Some(writer.handle()),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Stdin> for OpenFile {
@@ -213,14 +222,14 @@ impl From<std::fs::File> for OpenFile {
     }
 }
 
-impl From<std::io::PipeReader> for OpenFile {
-    fn from(reader: std::io::PipeReader) -> Self {
+impl From<sys::pipes::PipeReader> for OpenFile {
+    fn from(reader: sys::pipes::PipeReader) -> Self {
         Self::PipeReader(reader)
     }
 }
 
-impl From<std::io::PipeWriter> for OpenFile {
-    fn from(writer: std::io::PipeWriter) -> Self {
+impl From<sys::pipes::PipeWriter> for OpenFile {
+    fn from(writer: sys::pipes::PipeWriter) -> Self {
         Self::PipeWriter(writer)
     }
 }

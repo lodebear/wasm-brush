@@ -110,6 +110,7 @@ fn install_panic_handlers() {
     // Set up panic handler. On release builds, it will capture panic details to a
     // temporary .toml file and report a human-readable message to the screen.
     //
+    #[cfg(not(target_arch = "wasm32"))]
     human_panic::setup_panic!(
         human_panic::Metadata::new(productinfo::PRODUCT_NAME, productinfo::PRODUCT_VERSION)
             .homepage(env!("CARGO_PKG_HOMEPAGE"))

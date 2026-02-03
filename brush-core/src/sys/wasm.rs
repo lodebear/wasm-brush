@@ -3,7 +3,8 @@ pub use crate::sys::stubs::fd;
 pub use crate::sys::stubs::fs;
 pub use crate::sys::stubs::input;
 pub(crate) use crate::sys::stubs::network;
-pub(crate) use crate::sys::stubs::pipes;
+/// Pipe support for monocp host integrations.
+pub mod pipes;
 pub use crate::sys::stubs::poll;
 pub use crate::sys::stubs::process;
 pub use crate::sys::stubs::resource;

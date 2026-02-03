@@ -10,18 +10,22 @@ use std::{
 
 use brush_parser::ast;
 use itertools::Itertools;
-use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt};
+#[cfg(not(target_arch = "wasm32"))]
+use sys::commands::CommandFgControlExt;
+use sys::commands::{CommandExt, CommandFdInjectionExt};
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{ErrorKind, pathsearch, trace_categories};
 use crate::{
-    ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult,
-    Shell, ShellFd, builtins, commands, env, error, escape,
+    ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell, ShellFd,
+    builtins, commands, env, error, escape,
     extensions::{self, ShellExtensions},
     functions,
     interp::{self, Execute, ProcessGroupPolicy},
     openfiles::{self, OpenFile, OpenFiles},
-    pathsearch, processes,
+    processes,
     results::ExecutionSpawnResult,
-    sys, trace_categories, traps, variables,
+    sys, traps, variables,
 };
 
 /// Encapsulates the result of waiting for a command to complete.
@@ -73,6 +77,7 @@ impl<SE: ShellExtensions> ExecutionContext<'_, SE> {
         self.params.iter_fds(self.shell)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn should_cmd_lead_own_process_group(&self) -> bool {
         self.shell.options().interactive
             && matches!(
@@ -384,6 +389,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         clippy::missing_panics_doc,
         reason = "these unwrap calls should not panic"
     )]
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     pub async fn execute(mut self) -> Result<ExecutionSpawnResult, error::Error> {
         // First see if it's the name of a builtin.
         let builtin = self.shell.builtins().get(&self.command_name).cloned();
@@ -420,24 +426,33 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 
         // We still haven't found a command to invoke. We'll need to look for an external command.
         if !self.command_name.contains(std::path::MAIN_SEPARATOR) {
-            // All else failed; if we were given path directories to search, try to look through
-            // them for a matching executable. Otherwise, use our default search logic.
-            let path = if let Some(path_dirs) = &self.path_dirs {
-                pathsearch::search_for_executable(path_dirs.iter(), self.command_name.as_str())
-                    .next()
-            } else {
-                self.shell
-                    .find_first_executable_in_path_using_cache(&self.command_name)
-            };
+            #[cfg(target_arch = "wasm32")]
+            {
+                let command_name = self.command_name.clone();
+                return self.execute_via_external(Path::new(command_name.as_str()));
+            }
 
-            if let Some(path) = path {
-                self.execute_via_external(&path)
-            } else {
-                if let Some(post_execute) = self.post_execute {
-                    let _ = post_execute(&mut self.shell);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // All else failed; if we were given path directories to search, try to look through
+                // them for a matching executable. Otherwise, use our default search logic.
+                let path = if let Some(path_dirs) = &self.path_dirs {
+                    pathsearch::search_for_executable(path_dirs.iter(), self.command_name.as_str())
+                        .next()
+                } else {
+                    self.shell
+                        .find_first_executable_in_path_using_cache(&self.command_name)
+                };
+
+                if let Some(path) = path {
+                    self.execute_via_external(&path)
+                } else {
+                    if let Some(post_execute) = self.post_execute {
+                        let _ = post_execute(&mut self.shell);
+                    }
+
+                    Err(ErrorKind::CommandNotFound(self.command_name).into())
                 }
-
-                Err(ErrorKind::CommandNotFound(self.command_name).into())
             }
         } else {
             let command_name = PathBuf::from(self.command_name.clone());
@@ -451,13 +466,35 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     ) -> Result<ExecutionSpawnResult, error::Error> {
         match self.shell {
             ShellForCommand::OwnedShell { target, .. } => {
-                Ok(Self::execute_via_builtin_in_owned_shell(
-                    *target,
-                    self.params,
-                    builtin,
-                    self.command_name,
-                    self.args,
-                ))
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let mut shell = *target;
+                    let cmd_context = ExecutionContext {
+                        shell: &mut shell,
+                        command_name: self.command_name,
+                        params: self.params,
+                    };
+
+                    let result = execute_builtin_command(&builtin, cmd_context, self.args).await;
+
+                    if let Some(post_execute) = self.post_execute {
+                        let _ = post_execute(&mut shell);
+                    }
+
+                    let result = result?;
+                    return Ok(result.into());
+                }
+
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Ok(Self::execute_via_builtin_in_owned_shell(
+                        *target,
+                        self.params,
+                        builtin,
+                        self.command_name,
+                        self.args,
+                    ))
+                }
             }
             ShellForCommand::ParentShell(..) => {
                 self.execute_via_builtin_in_parent_shell(builtin).await
@@ -465,6 +502,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn execute_via_builtin_in_owned_shell(
         mut shell: Shell<SE>,
         params: ExecutionParameters,
@@ -556,6 +594,82 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn execute_external_command(
+    context: ExecutionContext<'_, impl extensions::ShellExtensions>,
+    executable_path: &str,
+    _process_group_id: Option<i32>,
+    args: &[CommandArg],
+) -> Result<ExecutionSpawnResult, error::Error> {
+    // Filter out the args; we only want strings.
+    let cmd_args = args
+        .iter()
+        .filter_map(|e| {
+            if let CommandArg::String(s) = e {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let command = Path::new(executable_path)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_else(|| context.command_name.as_str());
+
+    let mut argv: Vec<u8> = Vec::new();
+    argv.extend_from_slice(command.as_bytes());
+    argv.push(0);
+    let cwd = context.shell.working_dir().to_string_lossy();
+    argv.extend_from_slice(b"__monocp_cwd=");
+    argv.extend_from_slice(cwd.as_bytes());
+    argv.push(0);
+    for arg in &cmd_args {
+        argv.extend_from_slice(arg.as_bytes());
+        argv.push(0);
+    }
+
+    // Keep the cloned OpenFile values alive until after exec completes so their
+    // pipe handles remain registered with the host.
+    let stdin_file = context.try_fd(OpenFiles::STDIN_FD);
+    let stdout_file = context.try_fd(OpenFiles::STDOUT_FD);
+    let stderr_file = context.try_fd(OpenFiles::STDERR_FD);
+
+    let stdin_handle = stdin_file
+        .as_ref()
+        .and_then(|f| f.pipe_handle())
+        .unwrap_or(0);
+    let stdout_handle = stdout_file
+        .as_ref()
+        .and_then(|f| f.pipe_handle())
+        .unwrap_or(0);
+    let stderr_handle = stderr_file
+        .as_ref()
+        .and_then(|f| f.pipe_handle())
+        .unwrap_or(0);
+
+    let exit_code = unsafe {
+        monocp_exec_with_stdio(
+            argv.as_ptr(),
+            argv.len(),
+            stdin_handle,
+            stdout_handle,
+            stderr_handle,
+        )
+    };
+    let normalized = if exit_code < 0 {
+        127_u8
+    } else if exit_code > u8::MAX as i32 {
+        (exit_code & 0xFF) as u8
+    } else {
+        exit_code as u8
+    };
+
+    Ok(ExecutionResult::new(normalized).into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn execute_external_command(
     context: ExecutionContext<'_, impl extensions::ShellExtensions>,
     executable_path: &str,
@@ -664,6 +778,19 @@ pub(crate) fn execute_external_command(
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "monocp")]
+unsafe extern "C" {
+    #[link_name = "exec_with_stdio"]
+    fn monocp_exec_with_stdio(
+        ptr: *const u8,
+        len: usize,
+        stdin_handle: u32,
+        stdout_handle: u32,
+        stderr_handle: u32,
+    ) -> i32;
+}
+
 async fn execute_builtin_command<SE: extensions::ShellExtensions>(
     builtin: &builtins::Registration<SE>,
     context: ExecutionContext<'_, SE>,
@@ -761,7 +888,7 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     params.process_group_policy = ProcessGroupPolicy::SameProcessGroup;
 
     // Set up pipe so we can read the output.
-    let (reader, writer) = std::io::pipe()?;
+    let (reader, writer) = sys::pipes::pipe()?;
     params.set_fd(OpenFiles::STDOUT_FD, writer.into());
 
     // Start the execution of the command, but don't wait for it to

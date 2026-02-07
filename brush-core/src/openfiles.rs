@@ -4,6 +4,83 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::process::Stdio;
 
+#[cfg(target_os = "wasi")]
+#[derive(Clone)]
+pub(crate) struct SharedFile {
+    fd: u32,
+    inner: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+}
+
+#[cfg(target_os = "wasi")]
+impl SharedFile {
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        use std::os::fd::AsRawFd as _;
+
+        let fd = file.as_raw_fd();
+        Self {
+            fd: fd as u32,
+            inner: std::sync::Arc::new(std::sync::Mutex::new(file)),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(self.clone())
+    }
+
+    pub(crate) fn wasi_fd(&self) -> u32 {
+        self.fd
+    }
+
+    pub(crate) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.lock()?.metadata()
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.lock().is_ok_and(|f| f.is_terminal())
+    }
+
+    fn lock(&self) -> std::io::Result<std::sync::MutexGuard<'_, std::fs::File>> {
+        self.inner.lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "shared file lock poisoned")
+        })
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl std::io::Read for SharedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut file = self.lock()?;
+        std::io::Read::read(&mut *file, buf)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl std::io::Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self.lock()?;
+        std::io::Write::write(&mut *file, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut file = self.lock()?;
+        std::io::Write::flush(&mut *file)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl From<SharedFile> for Stdio {
+    fn from(_file: SharedFile) -> Self {
+        // WASI builds do not spawn child processes via std::process directly.
+        // External command execution is delegated to the host using monocp.exec.
+        Self::null()
+    }
+}
+
+#[cfg(target_os = "wasi")]
+type OpenFileSystemFile = SharedFile;
+#[cfg(not(target_os = "wasi"))]
+type OpenFileSystemFile = std::fs::File;
+
 use crate::ShellFd;
 use crate::error;
 use crate::sys;
@@ -29,6 +106,7 @@ pub trait Stream: std::io::Read + std::io::Write + Send + Sync {
 }
 
 /// Represents a file open in a shell context.
+#[cfg_attr(target_os = "wasi", allow(private_interfaces))]
 pub enum OpenFile {
     /// The original standard input this process was started with.
     Stdin(std::io::Stdin),
@@ -37,7 +115,7 @@ pub enum OpenFile {
     /// The original standard error this process was started with.
     Stderr(std::io::Stderr),
     /// A file open for reading or writing.
-    File(std::fs::File),
+    File(OpenFileSystemFile),
     /// A read end of a pipe.
     PipeReader(sys::pipes::PipeReader),
     /// A write end of a pipe.
@@ -89,7 +167,7 @@ impl<'de> serde::Deserialize<'de> for OpenFile {
 /// Returns an open file that will discard all I/O.
 pub fn null() -> Result<OpenFile, error::Error> {
     let file = sys::fs::open_null_file()?;
-    Ok(OpenFile::File(file))
+    Ok(file.into())
 }
 
 impl Clone for OpenFile {
@@ -121,7 +199,7 @@ impl OpenFile {
             Self::Stdin(_) => std::io::stdin().into(),
             Self::Stdout(_) => std::io::stdout().into(),
             Self::Stderr(_) => std::io::stderr().into(),
-            Self::File(f) => f.try_clone()?.into(),
+            Self::File(f) => Self::File(f.try_clone()?),
             Self::PipeReader(f) => f.try_clone()?.into(),
             Self::PipeWriter(f) => f.try_clone()?.into(),
             Self::Stream(s) => Self::Stream(s.clone_box()),
@@ -185,6 +263,17 @@ impl OpenFile {
         }
     }
 
+    #[cfg(target_os = "wasi")]
+    pub(crate) fn wasi_fd(&self) -> Option<u32> {
+        match self {
+            Self::Stdin(_) => Some(0),
+            Self::Stdout(_) => Some(1),
+            Self::Stderr(_) => Some(2),
+            Self::File(f) => Some(f.wasi_fd()),
+            Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => None,
+        }
+    }
+
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn pipe_handle(&self) -> Option<u32> {
         match self {
@@ -218,7 +307,15 @@ impl From<std::io::Stderr> for OpenFile {
 
 impl From<std::fs::File> for OpenFile {
     fn from(file: std::fs::File) -> Self {
-        Self::File(file)
+        #[cfg(target_os = "wasi")]
+        {
+            Self::File(SharedFile::new(file))
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            Self::File(file)
+        }
     }
 }
 
@@ -424,11 +521,16 @@ impl OpenFiles {
         self.files.insert(fd, Some(file)).and_then(|f| f)
     }
 
-    /// Iterates over all file descriptors.
+    /// Iterates over all file descriptors that are explicitly present and open.
     pub fn iter_fds(&self) -> impl Iterator<Item = (ShellFd, &OpenFile)> {
         self.files
             .iter()
             .filter_map(|(fd, file)| file.as_ref().map(|f| (*fd, f)))
+    }
+
+    /// Iterates over the full explicit fd table (including fds explicitly closed via `>&-`).
+    pub(crate) fn iter_fd_table(&self) -> impl Iterator<Item = (ShellFd, Option<&OpenFile>)> {
+        self.files.iter().map(|(fd, file)| (*fd, file.as_ref()))
     }
 
     /// Adds a new open file, returning the assigned file descriptor.

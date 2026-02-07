@@ -170,6 +170,32 @@ impl ExecutionParameters {
 
         all_fds.into_iter()
     }
+
+    /// Returns a snapshot of the effective fd table for this execution context.
+    ///
+    /// The snapshot includes:
+    /// - fds explicitly open in this context
+    /// - fds explicitly closed in this context (via `>&-`)
+    /// - inherited fds from the shell's persistent open files (if not overridden)
+    pub(crate) fn fd_table_snapshot(
+        &self,
+        shell: &Shell<impl extensions::ShellExtensions>,
+    ) -> Vec<(ShellFd, Option<openfiles::OpenFile>)> {
+        let mut out: Vec<(ShellFd, Option<openfiles::OpenFile>)> = self
+            .open_files
+            .iter_fd_table()
+            .map(|(fd, file)| (fd, file.cloned()))
+            .collect();
+
+        for (fd, file) in shell.persistent_open_files().iter_fds() {
+            if self.open_files.contains_fd(fd) {
+                continue;
+            }
+            out.push((fd, Some(file.clone())));
+        }
+
+        out
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1087,7 +1113,8 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                         &params,
                         kind,
                         subshell_command,
-                    )?;
+                    )
+                    .await?;
 
                     params
                         .open_files
@@ -1703,7 +1730,8 @@ pub(crate) async fn setup_redirect(
                                 params,
                                 substitution_kind,
                                 subshell_cmd,
-                            )?;
+                            )
+                            .await?;
 
                             let target_file = substitution_file.try_clone()?;
                             params.open_files.set_fd(substitution_fd, substitution_file);
@@ -1803,13 +1831,12 @@ const fn get_default_fd_for_redirect_kind(kind: &ast::IoFileRedirectKind) -> She
     }
 }
 
-fn setup_process_substitution(
+async fn setup_process_substitution(
     shell: &Shell<impl extensions::ShellExtensions>,
     params: &ExecutionParameters,
     kind: &ast::ProcessSubstitutionKind,
     subshell_cmd: &ast::SubshellCommand,
 ) -> Result<(ShellFd, OpenFile), error::Error> {
-    // TODO(execute): Don't execute synchronously!
     // Execute in a subshell.
     let mut subshell = shell.clone();
 
@@ -1832,16 +1859,12 @@ fn setup_process_substitution(
         }
     };
 
-    // Asynchronously spawn off the subshell; we intentionally don't block on its
-    // completion.
-    let subshell_cmd = subshell_cmd.to_owned();
-    tokio::spawn(async move {
-        // Intentionally ignore the result of the subshell command.
-        let _ = subshell_cmd
-            .list
-            .execute(&mut subshell, &child_params)
-            .await;
-    });
+    // Execute the subshell command to completion.
+    //
+    // On wasm32/wasi builds, external commands are executed by the host in a synchronous
+    // call. That blocks this WASM instance, so a background task would never run and
+    // the consumer would deadlock waiting for the producer.
+    let _ = subshell_cmd.list.execute(&mut subshell, &child_params).await;
 
     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
     // available fd.

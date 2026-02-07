@@ -595,6 +595,33 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[repr(C)]
+struct MonocpExecContextV2 {
+    argv_ptr: u32,
+    argv_len: u32,
+    cwd_ptr: u32,
+    cwd_len: u32,
+    fds_ptr: u32,
+    fds_len: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[repr(C)]
+struct MonocpFdSpec {
+    child_fd: u32,
+    kind: u32,
+    value: u32,
+    flags: u32,
+}
+
+#[cfg(target_arch = "wasm32")]
+const MONOCP_FD_PIPE: u32 = 1;
+#[cfg(target_arch = "wasm32")]
+const MONOCP_FD_WASI_FD: u32 = 2;
+#[cfg(target_arch = "wasm32")]
+const MONOCP_FD_CLOSE: u32 = 3;
+
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn execute_external_command(
     context: ExecutionContext<'_, impl extensions::ShellExtensions>,
     executable_path: &str,
@@ -616,48 +643,96 @@ pub(crate) fn execute_external_command(
     let command = Path::new(executable_path)
         .file_name()
         .and_then(|v| v.to_str())
-        .unwrap_or_else(|| context.command_name.as_str());
+        .unwrap_or_else(|| context.command_name.as_str())
+        .to_string();
 
     let mut argv: Vec<u8> = Vec::new();
     argv.extend_from_slice(command.as_bytes());
-    argv.push(0);
-    let cwd = context.shell.working_dir().to_string_lossy();
-    argv.extend_from_slice(b"__monocp_cwd=");
-    argv.extend_from_slice(cwd.as_bytes());
     argv.push(0);
     for arg in &cmd_args {
         argv.extend_from_slice(arg.as_bytes());
         argv.push(0);
     }
 
-    // Keep the cloned OpenFile values alive until after exec completes so their
-    // pipe handles remain registered with the host.
-    let stdin_file = context.try_fd(OpenFiles::STDIN_FD);
-    let stdout_file = context.try_fd(OpenFiles::STDOUT_FD);
-    let stderr_file = context.try_fd(OpenFiles::STDERR_FD);
+    let cwd = context.shell.working_dir().to_string_lossy().into_owned();
 
-    let stdin_handle = stdin_file
-        .as_ref()
-        .and_then(|f| f.pipe_handle())
-        .unwrap_or(0);
-    let stdout_handle = stdout_file
-        .as_ref()
-        .and_then(|f| f.pipe_handle())
-        .unwrap_or(0);
-    let stderr_handle = stderr_file
-        .as_ref()
-        .and_then(|f| f.pipe_handle())
-        .unwrap_or(0);
+    // Capture a full fd table snapshot so pipe/file handles remain alive for the duration
+    // of the host exec call.
+    let fd_table = context.params.fd_table_snapshot(context.shell);
 
+    let mut fds: Vec<MonocpFdSpec> = Vec::with_capacity(fd_table.len());
+    for (fd, entry) in &fd_table {
+        if *fd < 0 {
+            continue;
+        }
+        let child_fd = *fd as u32;
+        match entry {
+            Some(file) => {
+                if let Some(handle) = file.pipe_handle() {
+                    fds.push(MonocpFdSpec {
+                        child_fd,
+                        kind: MONOCP_FD_PIPE,
+                        value: handle,
+                        flags: 0,
+                    });
+                    continue;
+                }
+
+                #[cfg(target_os = "wasi")]
+                if let Some(wasi_fd) = file.wasi_fd() {
+                    fds.push(MonocpFdSpec {
+                        child_fd,
+                        kind: MONOCP_FD_WASI_FD,
+                        value: wasi_fd,
+                        flags: 0,
+                    });
+                    continue;
+                }
+
+                return Err(error::ErrorKind::NotSupportedOnThisPlatform(
+                    "propagating non-file/pipe fds",
+                )
+                .into());
+            }
+            None => {
+                fds.push(MonocpFdSpec {
+                    child_fd,
+                    kind: MONOCP_FD_CLOSE,
+                    value: 0,
+                    flags: 0,
+                });
+            }
+        }
+    }
+
+    let to_u32 = |value: usize| -> Result<u32, error::Error> {
+        u32::try_from(value).map_err(|_| {
+            error::ErrorKind::FailedToExecuteCommand(
+                command.clone(),
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "exec context too large"),
+            )
+            .into()
+        })
+    };
+
+    let ctx = MonocpExecContextV2 {
+        argv_ptr: to_u32(argv.as_ptr() as usize)?,
+        argv_len: to_u32(argv.len())?,
+        cwd_ptr: to_u32(cwd.as_ptr() as usize)?,
+        cwd_len: to_u32(cwd.len())?,
+        fds_ptr: to_u32(fds.as_ptr() as usize)?,
+        fds_len: to_u32(fds.len())?,
+    };
+
+    // SAFETY: monocp_exec_with_context_v2 expects a valid context struct pointer and we keep
+    // argv/cwd/fd-table buffers alive for the duration of the call.
     let exit_code = unsafe {
-        monocp_exec_with_stdio(
-            argv.as_ptr(),
-            argv.len(),
-            stdin_handle,
-            stdout_handle,
-            stderr_handle,
+        monocp_exec_with_context_v2(
+            std::ptr::from_ref(&ctx).cast::<u8>(),
+            std::mem::size_of::<MonocpExecContextV2>(),
         )
     };
+
     let normalized = if exit_code < 0 {
         127_u8
     } else if exit_code > u8::MAX as i32 {
@@ -781,14 +856,8 @@ pub(crate) fn execute_external_command(
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "monocp")]
 unsafe extern "C" {
-    #[link_name = "exec_with_stdio"]
-    fn monocp_exec_with_stdio(
-        ptr: *const u8,
-        len: usize,
-        stdin_handle: u32,
-        stdout_handle: u32,
-        stderr_handle: u32,
-    ) -> i32;
+    #[link_name = "exec_with_context_v2"]
+    fn monocp_exec_with_context_v2(ctx_ptr: *const u8, ctx_len: usize) -> i32;
 }
 
 async fn execute_builtin_command<SE: extensions::ShellExtensions>(

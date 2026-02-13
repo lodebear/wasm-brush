@@ -124,6 +124,10 @@ impl<SE: extensions::ShellExtensions> crate::Shell<SE> {
             ExecutionWaitResult::Stopped(..) => {
                 error::unimp("stopped child from function invocation")
             }
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            ExecutionWaitResult::RunningHostChild(..) => {
+                error::unimp("running host child from function invocation")
+            }
         }
     }
 }

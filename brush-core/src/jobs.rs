@@ -8,6 +8,8 @@ use futures::FutureExt;
 use crate::ExecutionResult;
 use crate::error;
 use crate::processes;
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+use crate::results::HostChildHandle;
 use crate::sys;
 use crate::trace_categories;
 use crate::traps;
@@ -28,6 +30,9 @@ pub enum JobTask {
     External(processes::ChildProcess),
     /// An internal asynchronous task.
     Internal(JobJoinHandle),
+    /// A host-side child process handle (preview2 monocp host API).
+    #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+    HostChild(HostChildHandle),
 }
 
 /// Represents the result of waiting on a job task.
@@ -52,6 +57,24 @@ impl JobTask {
                 }
             }
             Self::Internal(handle) => Ok(JobTaskWaitResult::Completed(handle.await??)),
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            Self::HostChild(handle) => {
+                use crate::sys::wasm::monocp_p2::monocp::host::monocp;
+
+                let child_id = handle.raw().ok_or_else(|| {
+                    error::Error::from(std::io::Error::other("invalid host child handle"))
+                })?;
+                let exit = loop {
+                    if let Some(exit) = monocp::try_wait_child(child_id) {
+                        break exit;
+                    }
+                    tokio::task::yield_now().await;
+                };
+                handle.disarm();
+                Ok(JobTaskWaitResult::Completed(ExecutionResult::new(
+                    normalize_host_exit_code(exit),
+                )))
+            }
         }
     }
 
@@ -68,6 +91,20 @@ impl JobTask {
             Self::Internal(handle) => {
                 let checkable_handle = handle;
                 checkable_handle.now_or_never().and_then(|r| r.ok())
+            }
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            Self::HostChild(handle) => {
+                use crate::sys::wasm::monocp_p2::monocp::host::monocp;
+
+                let Some(child_id) = handle.raw() else {
+                    return None;
+                };
+                if let Some(exit) = monocp::try_wait_child(child_id) {
+                    handle.disarm();
+                    Some(Ok(ExecutionResult::new(normalize_host_exit_code(exit))))
+                } else {
+                    None
+                }
             }
         }
     }
@@ -424,10 +461,31 @@ impl Job {
     /// * `signal` - The signal to send to the job.
     pub fn kill(&self, signal: traps::TrapSignal) -> Result<(), error::Error> {
         if let Some(pid) = self.process_group_id() {
-            sys::signal::kill_process(pid, signal)
-        } else {
-            Err(error::ErrorKind::FailedToSendSignal.into())
+            return sys::signal::kill_process(pid, signal);
         }
+
+        #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+        {
+            use crate::sys::wasm::monocp_p2::monocp::host::monocp;
+
+            let mut has_host_child = false;
+            for task in &self.tasks {
+                if let JobTask::HostChild(handle) = task {
+                    has_host_child = true;
+                    if let Some(child_id) = handle.raw() {
+                        monocp::kill_child(child_id)
+                            .map_err(std::io::Error::other)
+                            .map_err(error::Error::from)?;
+                    }
+                }
+            }
+
+            if has_host_child {
+                return Ok(());
+            }
+        }
+
+        Err(error::ErrorKind::FailedToSendSignal.into())
     }
 
     /// Tries to retrieve a "representative" pid for the job.
@@ -440,6 +498,8 @@ impl Job {
                     }
                 }
                 JobTask::Internal(_) => (),
+                #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+                JobTask::HostChild(_) => (),
             }
         }
         None
@@ -449,5 +509,16 @@ impl Job {
     pub fn process_group_id(&self) -> Option<sys::process::ProcessId> {
         // TODO(jobs): Don't assume that the first PID is the PGID.
         self.pgid.or_else(|| self.representative_pid())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+fn normalize_host_exit_code(exit_code: i32) -> u8 {
+    if exit_code < 0 {
+        127_u8
+    } else if exit_code > u8::MAX as i32 {
+        (exit_code & 0xFF) as u8
+    } else {
+        exit_code as u8
     }
 }

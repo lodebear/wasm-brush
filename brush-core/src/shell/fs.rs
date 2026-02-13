@@ -184,6 +184,7 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
         options: &std::fs::OpenOptions,
         path: impl AsRef<Path>,
         params: &ExecutionParameters,
+        meta: openfiles::OpenFileMeta,
     ) -> Result<openfiles::OpenFile, std::io::Error> {
         let path_to_open = self.absolute_path(path.as_ref());
 
@@ -202,7 +203,20 @@ impl<SE: crate::extensions::ShellExtensions> crate::Shell<SE> {
             }
         }
 
-        Ok(options.open(path_to_open)?.into())
+        let file = options.open(&path_to_open)?;
+
+        #[cfg(target_os = "wasi")]
+        {
+            return Ok(openfiles::OpenFile::File(
+                openfiles::SharedFile::new_with_meta(file, Some(path_to_open), meta),
+            ));
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let _ = meta;
+            return Ok(file.into());
+        }
     }
 
     /// Replaces the shell's currently configured open files with the given set.

@@ -2,31 +2,69 @@
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::process::Stdio;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OpenFileMeta {
+    pub read: bool,
+    pub write: bool,
+    pub append: bool,
+}
+
 #[cfg(target_os = "wasi")]
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct SharedFile {
     fd: u32,
     inner: std::sync::Arc<std::sync::Mutex<std::fs::File>>,
+    path: Option<PathBuf>,
+    meta: OpenFileMeta,
 }
 
 #[cfg(target_os = "wasi")]
 impl SharedFile {
     pub(crate) fn new(file: std::fs::File) -> Self {
+        Self::new_with_meta(file, None, OpenFileMeta::default())
+    }
+
+    pub(crate) fn new_with_meta(
+        file: std::fs::File,
+        path: Option<PathBuf>,
+        meta: OpenFileMeta,
+    ) -> Self {
         use std::os::fd::AsRawFd as _;
 
         let fd = file.as_raw_fd();
         Self {
             fd: fd as u32,
             inner: std::sync::Arc::new(std::sync::Mutex::new(file)),
+            path,
+            meta,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> Option<&PathBuf> {
+        self.path.as_ref()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn meta(&self) -> OpenFileMeta {
+        self.meta
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.inner) as usize
     }
 
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
         Ok(self.clone())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn wasi_fd(&self) -> u32 {
         self.fd
     }
@@ -264,6 +302,7 @@ impl OpenFile {
     }
 
     #[cfg(target_os = "wasi")]
+    #[allow(dead_code)]
     pub(crate) fn wasi_fd(&self) -> Option<u32> {
         match self {
             Self::Stdin(_) => Some(0),
@@ -271,6 +310,24 @@ impl OpenFile {
             Self::Stderr(_) => Some(2),
             Self::File(f) => Some(f.wasi_fd()),
             Self::PipeReader(_) | Self::PipeWriter(_) | Self::Stream(_) => None,
+        }
+    }
+
+    #[cfg(target_os = "wasi")]
+    #[allow(dead_code)]
+    pub(crate) fn wasi_file_meta(&self) -> Option<(&PathBuf, OpenFileMeta)> {
+        match self {
+            Self::File(f) => f.path().map(|p| (p, f.meta())),
+            _ => None,
+        }
+    }
+
+    #[cfg(target_os = "wasi")]
+    #[allow(dead_code)]
+    pub(crate) fn wasi_file_id(&self) -> Option<usize> {
+        match self {
+            Self::File(f) => Some(f.id()),
+            _ => None,
         }
     }
 

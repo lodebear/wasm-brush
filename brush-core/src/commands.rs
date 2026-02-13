@@ -594,7 +594,7 @@ impl<'a, SE: extensions::ShellExtensions> SimpleCommand<'a, SE> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 #[repr(C)]
 struct MonocpExecContextV2 {
     argv_ptr: u32,
@@ -605,7 +605,7 @@ struct MonocpExecContextV2 {
     fds_len: u32,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 #[repr(C)]
 struct MonocpFdSpec {
     child_fd: u32,
@@ -614,14 +614,14 @@ struct MonocpFdSpec {
     flags: u32,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 const MONOCP_FD_PIPE: u32 = 1;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 const MONOCP_FD_WASI_FD: u32 = 2;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 const MONOCP_FD_CLOSE: u32 = 3;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 pub(crate) fn execute_external_command(
     context: ExecutionContext<'_, impl extensions::ShellExtensions>,
     executable_path: &str,
@@ -744,6 +744,121 @@ pub(crate) fn execute_external_command(
     Ok(ExecutionResult::new(normalized).into())
 }
 
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+pub(crate) fn execute_external_command(
+    context: ExecutionContext<'_, impl extensions::ShellExtensions>,
+    executable_path: &str,
+    _process_group_id: Option<i32>,
+    args: &[CommandArg],
+) -> Result<ExecutionSpawnResult, error::Error> {
+    use crate::sys::wasm::monocp_p2::monocp::host::monocp;
+    use std::collections::HashMap;
+
+    // Filter out the args; we only want strings.
+    let cmd_args = args
+        .iter()
+        .filter_map(|e| {
+            if let CommandArg::String(s) = e {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let command = Path::new(executable_path)
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_else(|| context.command_name.as_str())
+        .to_string();
+
+    let mut argv: Vec<String> = Vec::with_capacity(cmd_args.len() + 1);
+    argv.push(command.clone());
+    for arg in &cmd_args {
+        argv.push(arg.to_string());
+    }
+
+    let cwd = context.shell.working_dir().to_string_lossy().into_owned();
+
+    // Capture a full fd table snapshot so pipe/file handles remain alive for the duration
+    // of the host exec call.
+    let fd_table = context.params.fd_table_snapshot(context.shell);
+
+    let mut seen_files: HashMap<usize, u32> = HashMap::new();
+
+    let mut fds: Vec<monocp::FdBinding> = Vec::with_capacity(fd_table.len());
+    for (fd, entry) in &fd_table {
+        if *fd < 0 {
+            continue;
+        }
+        let child_fd = *fd as u32;
+
+        let target = match entry {
+            None => monocp::FdTarget::Close,
+            Some(file) => {
+                // Pipes
+                if let Some(handle) = file.pipe_handle() {
+                    match file {
+                        OpenFile::PipeReader(_) => monocp::FdTarget::PipeRead(handle),
+                        OpenFile::PipeWriter(_) => monocp::FdTarget::PipeWrite(handle),
+                        _ => {
+                            return Err(error::ErrorKind::NotSupportedOnThisPlatform(
+                                "propagating non-directional pipe handle",
+                            )
+                            .into());
+                        }
+                    }
+                } else if let Some(id) = file.wasi_file_id() {
+                    if let Some(existing_fd) = seen_files.get(&id) {
+                        monocp::FdTarget::Dup(*existing_fd)
+                    } else if let Some((path, meta)) = file.wasi_file_meta() {
+                        let path_str = path.to_string_lossy().into_owned();
+                        let target = if meta.write {
+                            monocp::FdTarget::FileWrite(monocp::FileWriteTarget {
+                                path: path_str,
+                                append: meta.append,
+                            })
+                        } else {
+                            monocp::FdTarget::FileRead(path_str)
+                        };
+                        seen_files.insert(id, child_fd);
+                        target
+                    } else {
+                        return Err(error::ErrorKind::NotSupportedOnThisPlatform(
+                            "propagating anonymous WASI file",
+                        )
+                        .into());
+                    }
+                } else {
+                    // stdio or unsupported
+                    match file {
+                        OpenFile::Stdin(_) | OpenFile::Stdout(_) | OpenFile::Stderr(_) => {
+                            monocp::FdTarget::Inherit
+                        }
+                        _ => {
+                            return Err(error::ErrorKind::NotSupportedOnThisPlatform(
+                                "propagating non-file/pipe fds",
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        };
+
+        fds.push(monocp::FdBinding {
+            fd: child_fd,
+            target,
+        });
+    }
+
+    let child_handle = monocp::spawn_with_context(&argv, &cwd, &fds).map_err(|msg| {
+        error::ErrorKind::FailedToExecuteCommand(command.clone(), std::io::Error::other(msg))
+    })?;
+
+    Ok(ExecutionSpawnResult::started_host_child(child_handle))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn execute_external_command(
     context: ExecutionContext<'_, impl extensions::ShellExtensions>,
@@ -853,7 +968,7 @@ pub(crate) fn execute_external_command(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_env = "p1"))]
 #[link(wasm_import_module = "monocp")]
 unsafe extern "C" {
     #[link_name = "exec_with_context_v2"]

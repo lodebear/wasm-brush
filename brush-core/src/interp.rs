@@ -582,6 +582,16 @@ async fn wait_for_pipeline_processes_and_update_status(
 
                 stopped_children.push(jobs::JobTask::External(child));
             }
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            ExecutionWaitResult::RunningHostChild(child) => {
+                result = ExecutionResult::stopped();
+                shell.set_last_exit_status(result.exit_code.into());
+                shell
+                    .last_pipeline_statuses_mut()
+                    .push(result.exit_code.into());
+
+                stopped_children.push(jobs::JobTask::HostChild(child));
+            }
         }
     }
 
@@ -1108,13 +1118,9 @@ impl<SE: extensions::ShellExtensions> ExecuteInPipeline<SE> for ast::SimpleComma
                     }
                 }
                 CommandPrefixOrSuffixItem::ProcessSubstitution(kind, subshell_command) => {
-                    let (installed_fd_num, substitution_file) = setup_process_substitution(
-                        &context.shell,
-                        &params,
-                        kind,
-                        subshell_command,
-                    )
-                    .await?;
+                    let (installed_fd_num, substitution_file) =
+                        setup_process_substitution(&context.shell, &params, kind, subshell_command)
+                            .await?;
 
                     params
                         .open_files
@@ -1629,8 +1635,31 @@ pub(crate) async fn setup_redirect(
 
                     let fd_num = specified_fd_num.unwrap_or(default_fd_if_unspecified);
 
+                    let meta = match kind {
+                        ast::IoFileRedirectKind::Read | ast::IoFileRedirectKind::DuplicateInput => {
+                            crate::openfiles::OpenFileMeta {
+                                read: true,
+                                ..Default::default()
+                            }
+                        }
+                        ast::IoFileRedirectKind::Append => crate::openfiles::OpenFileMeta {
+                            write: true,
+                            append: true,
+                            ..Default::default()
+                        },
+                        ast::IoFileRedirectKind::ReadAndWrite => crate::openfiles::OpenFileMeta {
+                            read: true,
+                            write: true,
+                            ..Default::default()
+                        },
+                        _ => crate::openfiles::OpenFileMeta {
+                            write: true,
+                            ..Default::default()
+                        },
+                    };
+
                     let opened_file = shell
-                        .open_file(&options, &expanded_file_path, params)
+                        .open_file(&options, &expanded_file_path, params, meta)
                         .map_err(|err| {
                             error::ErrorKind::RedirectionFailure(
                                 expanded_file_path.to_string_lossy().to_string(),
@@ -1803,7 +1832,16 @@ fn setup_redirect_output_and_error_to(
         .append(append);
 
     let stdout_file = shell
-        .open_file(&file_options, &abs_file_path, params)
+        .open_file(
+            &file_options,
+            &abs_file_path,
+            params,
+            crate::openfiles::OpenFileMeta {
+                write: true,
+                append,
+                ..Default::default()
+            },
+        )
         .map_err(|err| {
             error::ErrorKind::RedirectionFailure(
                 abs_file_path.to_string_lossy().to_string(),
@@ -1864,7 +1902,10 @@ async fn setup_process_substitution(
     // On wasm32/wasi builds, external commands are executed by the host in a synchronous
     // call. That blocks this WASM instance, so a background task would never run and
     // the consumer would deadlock waiting for the producer.
-    let _ = subshell_cmd.list.execute(&mut subshell, &child_params).await;
+    let _ = subshell_cmd
+        .list
+        .execute(&mut subshell, &child_params)
+        .await;
 
     // Starting at 63 (a.k.a. 64-1)--and decrementing--look for an
     // available fd.

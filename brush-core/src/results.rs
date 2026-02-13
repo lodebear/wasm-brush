@@ -5,6 +5,41 @@ use std::os::unix::process::ExitStatusExt;
 
 use crate::{error, processes};
 
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+use crate::sys::wasm::monocp_p2::monocp::host::monocp;
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+/// Opaque handle to a host-side child process started through monocp preview2.
+pub struct HostChildHandle {
+    handle: Option<u64>,
+}
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+impl HostChildHandle {
+    pub(crate) const fn new(handle: u64) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) const fn raw(&self) -> Option<u64> {
+        self.handle
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.handle = None;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+impl Drop for HostChildHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            monocp::close_child(handle);
+        }
+    }
+}
+
 /// Represents the result of executing a command or similar item.
 #[derive(Default)]
 pub struct ExecutionResult {
@@ -105,6 +140,8 @@ impl From<ExecutionWaitResult> for ExecutionResult {
             ExecutionWaitResult::Completed(result) => result,
             // TODO(jobs): We need to job-manage the stopped process.
             ExecutionWaitResult::Stopped(..) => Self::stopped(),
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            ExecutionWaitResult::RunningHostChild(..) => Self::stopped(),
         }
     }
 }
@@ -249,6 +286,9 @@ pub enum ExecutionSpawnResult {
     StartedProcess(processes::ChildProcess),
     /// Indicates that a task was started to handle the execution asynchronously.
     StartedTask(tokio::task::JoinHandle<Result<ExecutionResult, error::Error>>),
+    /// Indicates that a host-side process was spawned via monocp preview2 APIs.
+    #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+    StartedHostChild(HostChildHandle),
 }
 
 impl From<ExecutionResult> for ExecutionSpawnResult {
@@ -258,6 +298,11 @@ impl From<ExecutionResult> for ExecutionSpawnResult {
 }
 
 impl ExecutionSpawnResult {
+    #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+    pub(crate) fn started_host_child(handle: u64) -> Self {
+        Self::StartedHostChild(HostChildHandle::new(handle))
+    }
+
     /// Waits for the command to complete.
     pub async fn wait(self) -> Result<ExecutionWaitResult, error::Error> {
         let result = match self {
@@ -276,6 +321,20 @@ impl ExecutionSpawnResult {
                 let result = join_handle.await?;
                 ExecutionWaitResult::Completed(result?)
             }
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            Self::StartedHostChild(mut handle) => {
+                let child_id = handle.raw().ok_or_else(|| {
+                    error::Error::from(std::io::Error::other("invalid host child handle"))
+                })?;
+                let exit = loop {
+                    if let Some(exit) = monocp::try_wait_child(child_id) {
+                        break exit;
+                    }
+                    tokio::task::yield_now().await;
+                };
+                handle.disarm();
+                ExecutionWaitResult::Completed(ExecutionResult::new(normalize_host_exit_code(exit)))
+            }
         };
 
         Ok(result)
@@ -290,9 +349,34 @@ impl ExecutionSpawnResult {
                 let result = join_handle.await?;
                 ExecutionWaitResult::Completed(result?)
             }
+            #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+            Self::StartedHostChild(mut handle) => {
+                let child_id = handle.raw().ok_or_else(|| {
+                    error::Error::from(std::io::Error::other("invalid host child handle"))
+                })?;
+                if let Some(exit) = monocp::try_wait_child(child_id) {
+                    handle.disarm();
+                    ExecutionWaitResult::Completed(ExecutionResult::new(normalize_host_exit_code(
+                        exit,
+                    )))
+                } else {
+                    ExecutionWaitResult::RunningHostChild(handle)
+                }
+            }
         };
 
         Ok(result)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+fn normalize_host_exit_code(exit_code: i32) -> u8 {
+    if exit_code < 0 {
+        127_u8
+    } else if exit_code > u8::MAX as i32 {
+        (exit_code & 0xFF) as u8
+    } else {
+        exit_code as u8
     }
 }
 
@@ -302,4 +386,7 @@ pub enum ExecutionWaitResult {
     Completed(ExecutionResult),
     /// Indicates that the execution was stopped.
     Stopped(processes::ChildProcess),
+    /// Indicates that a host-side child is still running.
+    #[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+    RunningHostChild(HostChildHandle),
 }

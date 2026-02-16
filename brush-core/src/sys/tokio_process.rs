@@ -7,3 +7,7 @@ pub(crate) fn spawn(command: std::process::Command) -> std::io::Result<Child> {
     let mut command = tokio::process::Command::from(command);
     command.spawn()
 }
+
+pub(crate) fn current_process_id() -> u32 {
+    std::process::id()
+}

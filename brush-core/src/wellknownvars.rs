@@ -80,13 +80,11 @@ pub(crate) fn init_well_known_vars(
     shell.env_mut().set_global("BASHOPTS", bashopts_var)?;
 
     // BASHPID
-    #[cfg(not(target_family = "wasm"))]
-    {
-        let mut bashpid_var =
-            ShellVariable::new(ShellValue::String(std::process::id().to_string()));
-        bashpid_var.treat_as_integer();
-        shell.env_mut().set_global("BASHPID", bashpid_var)?;
-    }
+    let mut bashpid_var = ShellVariable::new(ShellValue::String(
+        sys::process::current_process_id().to_string(),
+    ));
+    bashpid_var.treat_as_integer();
+    shell.env_mut().set_global("BASHPID", bashpid_var)?;
 
     // BASH_ALIASES
     shell.env_mut().set_global(

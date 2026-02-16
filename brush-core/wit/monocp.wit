@@ -15,6 +15,12 @@ interface monocp {
   pipe-write: func(handle: u32, data: list<u8>) -> u32;
   pipe-close: func(handle: u32);
 
+  /// Return a process identifier for the current Brush shell instance.
+  ///
+  /// This should be stable for the lifetime of the shell process and is used
+  /// for parameters such as `$$` / `BASHPID`.
+  process-id: func() -> u32;
+
   /// File target for output redirections.
   record file-write-target {
     path: string,

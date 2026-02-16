@@ -32,3 +32,13 @@ pub(crate) fn spawn(mut command: std::process::Command) -> std::io::Result<Child
     let child = command.spawn()?;
     Ok(Child { inner: child })
 }
+
+#[cfg(all(target_arch = "wasm32", target_env = "p2"))]
+pub(crate) fn current_process_id() -> u32 {
+    crate::sys::wasm::monocp_p2::monocp::host::monocp::process_id()
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_env = "p2")))]
+pub(crate) fn current_process_id() -> u32 {
+    std::process::id()
+}

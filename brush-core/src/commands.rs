@@ -1075,29 +1075,48 @@ pub(crate) async fn invoke_command_in_subshell_and_get_output(
     let (reader, writer) = sys::pipes::pipe()?;
     params.set_fd(OpenFiles::STDOUT_FD, writer.into());
 
-    // Start the execution of the command, but don't wait for it to
-    // complete. In case the command generates lots of output, we
-    // need to start reading in parallel so the command doesn't block
-    // when the pipe's buffer fills up. We pass ownership of the
-    // subshell and params to run_substitution_command; we must
-    // ensure that they're both dropped by the time this call
-    // returns (so they're not holding onto the write end of the pipe).
-    let cmd_join_handle = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(run_substitution_command(subshell, params, s))
-    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        // On wasm32, tokio::spawn_blocking may not be supported by the runtime
+        // (e.g., no worker-thread support). Run the substitution command inline,
+        // then read from the pipe once the writer has been dropped.
+        let cmd_result = run_substitution_command(subshell, params, s).await?;
 
-    // Extract output.
-    let output_str = std::io::read_to_string(reader)?;
+        // Extract output.
+        let output_str = std::io::read_to_string(reader)?;
 
-    // Now observe the command's completion.
-    let run_result = cmd_join_handle.await?;
-    let cmd_result = run_result?;
+        // Store the status.
+        shell.set_last_exit_status(cmd_result.exit_code.into());
 
-    // Store the status.
-    shell.set_last_exit_status(cmd_result.exit_code.into());
+        return Ok(output_str);
+    }
 
-    Ok(output_str)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Start the execution of the command, but don't wait for it to
+        // complete. In case the command generates lots of output, we
+        // need to start reading in parallel so the command doesn't block
+        // when the pipe's buffer fills up. We pass ownership of the
+        // subshell and params to run_substitution_command; we must
+        // ensure that they're both dropped by the time this call
+        // returns (so they're not holding onto the write end of the pipe).
+        let cmd_join_handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(run_substitution_command(subshell, params, s))
+        });
+
+        // Extract output.
+        let output_str = std::io::read_to_string(reader)?;
+
+        // Now observe the command's completion.
+        let run_result = cmd_join_handle.await?;
+        let cmd_result = run_result?;
+
+        // Store the status.
+        shell.set_last_exit_status(cmd_result.exit_code.into());
+
+        Ok(output_str)
+    }
 }
 
 async fn run_substitution_command(

@@ -11,7 +11,7 @@ use brush_builtins::ShellBuilderExt as _;
 #[cfg(feature = "experimental-builtins")]
 use brush_experimental_builtins::ShellBuilderExt as _;
 use std::sync::LazyLock;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
 #[allow(unused_imports, reason = "only used in some configs")]
@@ -22,6 +22,26 @@ static TRACE_EVENT_CONFIG: LazyLock<Arc<tokio::sync::Mutex<Option<events::TraceE
 
 type BrushShellExtensions = brush_core::extensions::ShellExtensionsImpl<error_formatter::Formatter>;
 type BrushShell = brush_core::Shell<BrushShellExtensions>;
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+mod wasi_cli {
+    wit_bindgen::generate!({
+        path: "wit",
+        world: "initial-working-directory",
+        with: { "wasi:cli/environment@0.2.0": generate },
+    });
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn initial_working_directory() -> Option<PathBuf> {
+    // Rust's WASI PAL may report `/` instead of the host's initial directory.
+    wasi_cli::wasi::cli::environment::initial_cwd().map(PathBuf::from)
+}
+
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+const fn initial_working_directory() -> Option<PathBuf> {
+    None
+}
 
 // WARN: this implementation shadows `clap::Parser::parse_from` one so it must be defined
 // after the `use clap::Parser`
@@ -392,6 +412,14 @@ async fn instantiate_shell_from_args(
     args: &CommandLineArgs,
     cli_args: Vec<String>,
 ) -> Result<BrushShell, brush_interactive::ShellError> {
+    instantiate_shell_with_working_directory(args, cli_args, initial_working_directory()).await
+}
+
+async fn instantiate_shell_with_working_directory(
+    args: &CommandLineArgs,
+    cli_args: Vec<String>,
+    working_dir: Option<PathBuf>,
+) -> Result<BrushShell, brush_interactive::ShellError> {
     // Compute login flag.
     let login = args.login || cli_args.first().is_some_and(|argv0| argv0.starts_with('-'));
 
@@ -467,6 +495,7 @@ async fn instantiate_shell_from_args(
         .verbose(args.verbose)
         .error_formatter(new_error_behavior(args))
         .shell_version(env!("CARGO_PKG_VERSION").to_string());
+    let shell = shell.maybe_working_dir(working_dir);
 
     // Add builtins.
     let shell = shell.default_builtins(builtin_set).brush_builtins();
@@ -570,6 +599,35 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use pretty_assertions::{assert_eq, assert_matches};
+
+    #[tokio::test]
+    async fn initialize_shell_in_supplied_working_directory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let expected = directory.path().join("working directory");
+        std::fs::create_dir(&expected)?;
+        let cli_args = vec![String::from("brush")];
+        let args = CommandLineArgs::try_parse_from(cli_args.clone())?;
+        let shell =
+            instantiate_shell_with_working_directory(&args, cli_args, Some(expected.clone()))
+                .await?;
+
+        assert_eq!(shell.working_dir(), expected);
+        assert_eq!(
+            shell.env().get_str("PWD", &shell).as_deref(),
+            expected.to_str()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initialize_shell_without_supplied_working_directory() -> Result<()> {
+        let cli_args = vec![String::from("brush")];
+        let args = CommandLineArgs::try_parse_from(cli_args.clone())?;
+        let shell = instantiate_shell_with_working_directory(&args, cli_args, None).await?;
+
+        assert_eq!(shell.working_dir(), std::env::current_dir()?);
+        Ok(())
+    }
 
     #[test]
     fn parse_empty_args() -> Result<()> {

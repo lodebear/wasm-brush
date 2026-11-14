@@ -98,6 +98,9 @@ tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "sync"] }
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
 uuid = { version = "1.20.0", features = ["js"] }
 
+[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
+wit-bindgen = "0.51.0"
+
 [dev-dependencies]
 anyhow = "1.0.100"
 tempfile = "3.24.0"

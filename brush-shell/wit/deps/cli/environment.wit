@@ -1,0 +1,8 @@
+package wasi:cli@0.2.0;
+
+/// The standard WASI command environment supplied by the host.
+interface environment {
+    get-environment: func() -> list<tuple<string, string>>;
+    get-arguments: func() -> list<string>;
+    initial-cwd: func() -> option<string>;
+}
